@@ -195,8 +195,8 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-def _switch_topk(logits, k):
-    """Switch/Top‑k. Returns (indices, probs)."""
+def switch_topk(logits, k):
+    """Switch/Top‑k. Returns (indices, probs, expert output weights)."""
     probs      = logits.softmax(dim=-1)
     gate, topk_idx = torch.topk(probs, k, dim=-1)
     if k > 1:
@@ -205,23 +205,40 @@ def _switch_topk(logits, k):
         gate = gate / (gate + 10)
     return topk_idx, probs, gate
 
+
+def hash_select(token_ids, num_experts):
+    expert_idx = token_ids[..., None] % num_experts
+    probs = torch.full([*token_ids.shape, num_experts], fill_value=1.0 / num_experts, device=token_ids.device)
+    gate = torch.ones_like(expert_idx)
+    return expert_idx, probs, gate
+
 class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = 4
         self.top_k       = 1
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = 'switch'
+        self.router_type  = 'hash'
+
+        assert self.router_type in ('hash', 'switch')
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
-        self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        
+        if self.router_type == 'switch':
+            self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
 
 
-    def forward(self, x, idx=None):
-        logits = self.router(x)
+    def forward(self, x, token_idx=None):
+
         if self.router_type == "switch":
-            topk_idx, probs, gate = _switch_topk(logits, self.top_k)
-
+            logits = self.router(x)
+            topk_idx, probs, gate = switch_topk(logits, self.top_k)
+        elif self.router_type == "hash":
+            topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
+            gate = gate.to(x.dtype)
+            probs = probs.to(x.dtype)
+        else:
+            raise ValueError(f"unknown routing type: {self.router_type}")
         B, T, C = x.shape
         BT      = B * T
         x_flat  = x.reshape(BT, C)
@@ -258,8 +275,13 @@ class MoE(nn.Module):
                 token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
             # Switch paper:  L_aux = E * <load,prob>
-            probs_mean = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
-            aux = self.num_experts * (frac * probs_mean).sum()
+            if self.router_type == "switch":
+                probs_mean = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
+                aux = self.num_experts * (frac * probs_mean).sum()
+            elif self.router_type == "hash":
+                aux = torch.tensor(0.0, device=x.device)
+            else:
+                raise ValueError(f"unknown routing type: {self.router_type}")
 
         return y, aux, router_entropy, frac
 
@@ -271,9 +293,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MoE(config)
 
-    def forward(self, x):
+    def forward(self, x, token_idx=None):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)))
+        mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx)
         x = x + mlp_out
         return x, aux, router_entropy, expert_balance
 
@@ -311,7 +333,7 @@ class GPT(nn.Module):
         per_layer_router_entropy = []
         per_layer_expert_balance = []
         for block in self.transformer.h:
-            x, aux, router_entropy, expert_balance = block(x)
+            x, aux, router_entropy, expert_balance = block(x, idx)
             total_aux = total_aux + aux
             total_router_entropy = total_router_entropy + router_entropy
             if total_expert_balance is None:
@@ -438,7 +460,7 @@ class Hyperparameters:
     num_iterations : int = 4578 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 1308 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    weight_decay : float = 0.01
+    weight_decay : float = 0.0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -495,16 +517,11 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-router_params = []
-for block in raw_model.transformer.h:
-    router_params += list(block.mlp.router.parameters())
 all_h_params = list(raw_model.transformer.h.parameters())
-# router_param_set = set(router_params)
-# muon_params = [p for p in all_h_params if p not in router_param_set]
 muon_params = all_h_params
-optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), weight_decay=0.0, fused=True)
-optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
-# optimizer4 = torch.optim.AdamW(router_params, lr=0.002, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+
 optimizer3 = Muon(muon_params,                                     lr=0.02,  momentum=0.95)
 optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
@@ -577,8 +594,6 @@ if master_process:
                 'betas': tuple(optimizer2.param_groups[0]['betas']),
                 'fused': bool(optimizer2.param_groups[0].get('fused', False)),
                 'weight_decay': args.weight_decay,
-                'includes_router': True,
-                'router_param_count': int(sum(p.numel() for p in router_params)),
             },
             'muon_blocks': {
                 'type': 'Muon',
@@ -587,8 +602,6 @@ if master_process:
                 'nesterov': optimizer3.defaults.get('nesterov', None),
                 'backend': optimizer3.defaults.get('backend', None),
                 'backend_steps': optimizer3.defaults.get('backend_steps', None),
-                'excludes_router': True,
-                'muon_param_count': int(sum(p.numel() for p in muon_params)),
             }
         },
         'model': {
@@ -603,7 +616,7 @@ if master_process:
         'loss': {
             'type': 'cross_entropy',
             'ignore_index': -1,
-            'aux_coeff_train': 0.01,
+            'aux_coeff_train': 0.0,
             'aux_coeff_val': 0.0,
         },
         'dist': {
@@ -691,9 +704,12 @@ for step in range(args.num_iterations + 1):
         loss_ce.backward()
         ce_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
-            p = raw_model.transformer.h[li].mlp.router.weight
-            gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
-            ce_router_layer_grad_norms.append(gnorm)
+            if raw_model.transformer.h[li].mlp.router_type == "switch":
+                p = raw_model.transformer.h[li].mlp.router.weight
+                gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
+                ce_router_layer_grad_norms.append(gnorm)
+            else:
+                ce_router_layer_grad_norms.append(torch.tensor(0.0, device=device))
         ce_router_layer_grad_norms = torch.stack(ce_router_layer_grad_norms)
         dist.all_reduce(ce_router_layer_grad_norms, op=dist.ReduceOp.AVG)
         # 2) AUX-only
@@ -705,9 +721,12 @@ for step in range(args.num_iterations + 1):
         total_aux_probe.backward()
         aux_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
-            p = raw_model.transformer.h[li].mlp.router.weight
-            gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
-            aux_router_layer_grad_norms.append(gnorm)
+            if raw_model.transformer.h[li].mlp.router_type == "switch":
+                p = raw_model.transformer.h[li].mlp.router.weight
+                gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
+                aux_router_layer_grad_norms.append(gnorm)
+            else:
+                aux_router_layer_grad_norms.append(torch.tensor(0.0, device=device))
         aux_router_layer_grad_norms = torch.stack(aux_router_layer_grad_norms)
         dist.all_reduce(aux_router_layer_grad_norms, op=dist.ReduceOp.AVG)
         # zero out any probe grads
@@ -769,7 +788,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.01)
+            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.0)
             train_loss = loss.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
