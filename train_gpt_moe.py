@@ -199,10 +199,10 @@ def switch_topk(logits, k):
     """Switch/Top‑k. Returns (indices, probs, expert output weights)."""
     probs      = logits.softmax(dim=-1)
     gate, topk_idx = torch.topk(probs, k, dim=-1)
-    if k > 1:
-        gate = gate / gate.sum(dim=-1, keepdim=True)
-    else:
-        gate = gate / (gate + 10)
+    #if k > 1:
+    gate = gate / gate.sum(dim=-1, keepdim=True)
+    #else:
+    #gate = gate / (gate + 10)
     return topk_idx, probs, gate
 
 
@@ -218,7 +218,7 @@ class MoE(nn.Module):
         self.num_experts = 4
         self.top_k       = 1
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = 'hash'
+        self.router_type  = 'switch'
 
         assert self.router_type in ('hash', 'switch')
 
@@ -279,7 +279,7 @@ class MoE(nn.Module):
                 probs_mean = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
                 aux = self.num_experts * (frac * probs_mean).sum()
             elif self.router_type == "hash":
-                aux = torch.tensor(0.0, device=x.device)
+                aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
             else:
                 raise ValueError(f"unknown routing type: {self.router_type}")
 
@@ -616,7 +616,7 @@ if master_process:
         'loss': {
             'type': 'cross_entropy',
             'ignore_index': -1,
-            'aux_coeff_train': 0.0,
+            'aux_coeff_train': 0.01,
             'aux_coeff_val': 0.0,
         },
         'dist': {
@@ -788,7 +788,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.0)
+            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.01)
             train_loss = loss.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
