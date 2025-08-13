@@ -195,30 +195,30 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-def switch_topk(logits, k):
+def switch_topk(logits, k, null_expert_bias=0.0):
     """Switch/Top‑k. Returns (indices, probs, expert output weights)."""
     probs      = logits.softmax(dim=-1)
     gate, topk_idx = torch.topk(probs, k, dim=-1)
-    #if k > 1:
-    gate = gate / gate.sum(dim=-1, keepdim=True)
-    #else:
-    #gate = gate / (gate + 10)
+    gate = gate / (gate.sum(dim=-1, keepdim=True) + null_expert_bias)
     return topk_idx, probs, gate
 
 
-def hash_select(token_ids, num_experts):
-    expert_idx = token_ids[..., None] % num_experts
-    probs = torch.full([*token_ids.shape, num_experts], fill_value=1.0 / num_experts, device=token_ids.device)
-    gate = torch.ones_like(expert_idx)
-    return expert_idx, probs, gate
+def hash_select(token_ids, num_experts, null_expert_bias=0.0):
+    expert_idx = (token_ids[..., None].float() % num_experts).to(token_ids.dtype)
+    routing_weights = torch.nn.functional.one_hot(expert_idx, num_classes=num_experts)
+    selected_prob, selected_expert = torch.max(routing_weights, dim=-1, keepdim=True)
+    expert_mask = torch.nn.functional.one_hot(torch.argmax(routing_weights, dim=-1), num_classes=num_experts)
+    if null_expert_bias > 0:
+        selected_prob = selected_prob / (selected_prob + null_expert_bias)
+    return selected_expert, routing_weights, selected_prob
 
 class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.num_experts = 4
+        self.num_experts = 16
         self.top_k       = 1
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = 'switch'
+        self.router_type  = 'hash'
 
         assert self.router_type in ('hash', 'switch')
 
@@ -616,7 +616,7 @@ if master_process:
         'loss': {
             'type': 'cross_entropy',
             'ignore_index': -1,
-            'aux_coeff_train': 0.01,
+            'aux_coeff_train': 0.0,
             'aux_coeff_val': 0.0,
         },
         'dist': {
@@ -788,7 +788,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.01)
+            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.0)
             train_loss = loss.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
