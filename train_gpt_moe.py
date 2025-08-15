@@ -195,44 +195,80 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-def switch_topk(logits, k, null_expert_bias=0.0):
-    """Switch/Top‑k. Returns (indices, probs, expert output weights)."""
-    probs      = logits.softmax(dim=-1)
-    gate, topk_idx = torch.topk(probs, k, dim=-1)
-    gate = gate / (gate.sum(dim=-1, keepdim=True) + null_expert_bias)
-    return topk_idx, probs, gate
-
 
 def hash_select(token_ids, num_experts, null_expert_bias=0.0):
     expert_idx = (token_ids[..., None].float() % num_experts).to(token_ids.dtype)
     routing_weights = torch.nn.functional.one_hot(expert_idx, num_classes=num_experts)
     selected_prob, selected_expert = torch.max(routing_weights, dim=-1, keepdim=True)
-    expert_mask = torch.nn.functional.one_hot(torch.argmax(routing_weights, dim=-1), num_classes=num_experts)
+
     if null_expert_bias > 0:
         selected_prob = selected_prob / (selected_prob + null_expert_bias)
     return selected_expert, routing_weights, selected_prob
 
+def expert_mixing(x, experts, expert_ids, gate):
+    B, T, C = x.shape
+    x = x.reshape(B * T, C)
+    gate = gate.reshape(B * T, -1)
+    expert_ids = expert_ids.reshape(B * T, -1)
+    output = torch.zeros_like(x)
+    
+    for i in range(len(experts)):
+        mask = (expert_ids == i)
+        rows, cols = torch.nonzero(mask, as_tuple=True)
+        if len(rows) == 0:
+            continue
+        tokens = x[rows]
+        expert_out = experts[i](tokens)
+        weights = gate[rows, cols].unsqueeze(1)
+        output.index_add_(0, rows, expert_out * weights)
+
+    return output.reshape(B, T, C)
+
+
+class LearnedRouter(nn.Module):
+    def __init__(self, input_dim, num_experts, top_k, null_expert_bias=0.0):
+        super().__init__()
+        self.router = nn.Linear(input_dim, num_experts, bias=False)
+        self.top_k = top_k
+        self.null_expert_bias = 0.0
+    
+    def forward(self, x):
+        logits = self.router(x)
+        probs = logits.softmax(dim=-1)
+        gate, topk_idx = torch.topk(probs, self.top_k, dim=-1)
+        gate = gate / (gate.sum(dim=-1, keepdim=True) + self.null_expert_bias)
+        return topk_idx, probs, gate
+
+def aux_loss(probs, expert_ids):
+    num_experts = probs.size(-1)
+    counts = torch.bincount(
+        expert_ids.flatten(),
+        minlength=num_experts
+    ).float()
+    actual = counts / counts.sum()
+    expected = probs.reshape(-1, num_experts).mean(0)
+    return num_experts * (actual * expected).sum()
+
+
 class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.num_experts = 16
+        self.num_experts = 4
         self.top_k       = 1
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = 'hash'
-
-        assert self.router_type in ('hash', 'switch')
+        self.router_type  = 'learned'
+        self.null_expert_bias = 0.0
+        assert self.router_type in ('hash', 'learned')
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         
-        if self.router_type == 'switch':
-            self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
-
+        if self.router_type == 'learned':
+            self.router  = LearnedRouter(config.n_embd, self.num_experts, self.top_k, self.null_expert_bias)
 
     def forward(self, x, token_idx=None):
 
-        if self.router_type == "switch":
-            logits = self.router(x)
-            topk_idx, probs, gate = switch_topk(logits, self.top_k)
+        if self.router_type == "learned":
+            topk_idx, probs, gate = self.router(x, self.top_k, self.null_expert_bias)
         elif self.router_type == "hash":
             topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
             gate = gate.to(x.dtype)
@@ -248,40 +284,23 @@ class MoE(nn.Module):
         gate_flat = gate.reshape(BT, self.top_k)
         idx_flat  = topk_idx.reshape(BT, self.top_k)
 
-        #eps       = 1e-9
-        #token_H   = -(probs_flat * (probs_flat + eps).log()).sum(-1)      # (B·T,)
-        #router_H  = token_H.mean() / math.log(float(self.num_experts))  # scalar ∈ [0,1]
-
-        for expert_id in range(self.num_experts):
-            sel_mask = (idx_flat == expert_id)
-            token_rows, which_k = torch.nonzero(sel_mask, as_tuple=True)
-            inp   = x_flat.index_select(0, token_rows)
-            out   = self.experts[expert_id](inp)
-            coeff = gate_flat[token_rows, which_k].unsqueeze(1)
-            y_flat.index_add_(0, token_rows, out * coeff)
-
-        y = y_flat.view_as(x)
+        y = expert_mixing(x, self.experts, topk_idx, gate)
 
         # aux loss and router statistics
-        with torch.autocast(device_type="cpu", enabled=False):
-            tokens_per_expert = torch.bincount(
-                idx_flat.flatten(), minlength=self.num_experts
-            ).float()
 
-            frac = tokens_per_expert / tokens_per_expert.sum()
-            # token-wise entropy of router distribution (normalized to [0,1])
-            eps = 1e-9
-            with torch.no_grad():
-                token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
-                router_entropy = token_H.mean() / math.log(float(self.num_experts))
-            # Switch paper:  L_aux = E * <load,prob>
-            if self.router_type == "switch":
-                probs_mean = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
-                aux = self.num_experts * (frac * probs_mean).sum()
-            elif self.router_type == "hash":
-                aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
-            else:
-                raise ValueError(f"unknown routing type: {self.router_type}")
+        # token-wise entropy of router distribution (normalized to [0,1])
+        eps = 1e-9
+        with torch.no_grad():
+            token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
+            router_entropy = token_H.mean() / math.log(float(self.num_experts))
+        # learned paper:  L_aux = E * <load,prob>
+        if self.router_type == "learned":
+            aux = aux_loss(probs, idx_flat)
+
+        elif self.router_type == "hash":
+            aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
+        else:
+            raise ValueError(f"unknown routing type: {self.router_type}")
 
         return y, aux, router_entropy, frac
 
@@ -616,7 +635,7 @@ if master_process:
         'loss': {
             'type': 'cross_entropy',
             'ignore_index': -1,
-            'aux_coeff_train': 0.0,
+            'aux_coeff_train': 0.01,
             'aux_coeff_val': 0.0,
         },
         'dist': {
@@ -704,7 +723,7 @@ for step in range(args.num_iterations + 1):
         loss_ce.backward()
         ce_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
-            if raw_model.transformer.h[li].mlp.router_type == "switch":
+            if raw_model.transformer.h[li].mlp.router_type == "learned":
                 p = raw_model.transformer.h[li].mlp.router.weight
                 gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
                 ce_router_layer_grad_norms.append(gnorm)
@@ -721,7 +740,7 @@ for step in range(args.num_iterations + 1):
         total_aux_probe.backward()
         aux_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
-            if raw_model.transformer.h[li].mlp.router_type == "switch":
+            if raw_model.transformer.h[li].mlp.router_type == "learned":
                 p = raw_model.transformer.h[li].mlp.router.weight
                 gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
                 aux_router_layer_grad_norms.append(gnorm)
@@ -788,7 +807,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.0)
+            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.01)
             train_loss = loss.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
