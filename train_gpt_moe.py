@@ -33,7 +33,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
@@ -247,7 +247,7 @@ def aux_loss(probs, expert_ids):
     ).float()
     actual = counts / counts.sum()
     expected = probs.reshape(-1, num_experts).mean(0)
-    return num_experts * (actual * expected).sum()
+    return num_experts * (actual * expected).sum(), actual
 
 
 class MoE(nn.Module):
@@ -294,10 +294,9 @@ class MoE(nn.Module):
             token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
             router_entropy = token_H.mean() / math.log(float(self.num_experts))
         # learned paper:  L_aux = E * <load,prob>
-        if self.router_type == "learned":
-            aux = aux_loss(probs, idx_flat)
-
-        elif self.router_type == "hash":
+        
+        aux, frac = aux_loss(probs, idx_flat)
+        if self.router_type == "hash":
             aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
         else:
             raise ValueError(f"unknown routing type: {self.router_type}")
@@ -631,6 +630,7 @@ if master_process:
             'num_experts': num_experts,
             'router_type': raw_model.transformer.h[0].mlp.router_type,
             'router_top_k': raw_model.transformer.h[0].mlp.top_k,
+            'null_expert_bias': raw_model.transformer.h[0].mlp.null_expert_bias,
         },
         'loss': {
             'type': 'cross_entropy',
