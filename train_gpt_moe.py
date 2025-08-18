@@ -230,7 +230,7 @@ class LearnedRouter(nn.Module):
         super().__init__()
         self.router = nn.Linear(input_dim, num_experts, bias=False)
         self.top_k = top_k
-        self.null_expert_bias = 0.0
+        self.null_expert_bias = null_expert_bias
     
     def forward(self, x):
         logits = self.router(x)
