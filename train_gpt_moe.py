@@ -268,7 +268,7 @@ class MoE(nn.Module):
     def forward(self, x, token_idx=None):
 
         if self.router_type == "learned":
-            topk_idx, probs, gate = self.router(x, self.top_k, self.null_expert_bias)
+            topk_idx, probs, gate = self.router(x)
         elif self.router_type == "hash":
             topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
             gate = gate.to(x.dtype)
@@ -299,7 +299,7 @@ class MoE(nn.Module):
         if self.router_type == "hash":
             aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
         else:
-            raise ValueError(f"unknown routing type: {self.router_type}")
+            pass
 
         return y, aux, router_entropy, frac
 
@@ -724,7 +724,7 @@ for step in range(args.num_iterations + 1):
         ce_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
             if raw_model.transformer.h[li].mlp.router_type == "learned":
-                p = raw_model.transformer.h[li].mlp.router.weight
+                p = raw_model.transformer.h[li].mlp.router.router.weight
                 gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
                 ce_router_layer_grad_norms.append(gnorm)
             else:
@@ -741,7 +741,7 @@ for step in range(args.num_iterations + 1):
         aux_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
             if raw_model.transformer.h[li].mlp.router_type == "learned":
-                p = raw_model.transformer.h[li].mlp.router.weight
+                p = raw_model.transformer.h[li].mlp.router.router.weight
                 gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
                 aux_router_layer_grad_norms.append(gnorm)
             else:
