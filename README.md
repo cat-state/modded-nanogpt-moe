@@ -27,8 +27,8 @@ python data/cached_fineweb10B.py 24
 ```
 
 ## References
-0. [Daria Soboleva and Aman Tiwari](https://www.cerebras.ai/blog/moe-guide-debug)
-1. [Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and @fernbear.bsky.social and Boza Vlado and You Jiacheng and Franz Cesista and Braden Koszarsky and @Grad62304977modded-nanogpt: Speedrunning the NanoGPT baseline](https://github.com/KellerJordan/modded-nanogpt)
+0. [Daria Soboleva and Aman Tiwari. Debugging Dead MoE Models: A Step-by-step Guide](https://www.cerebras.ai/blog/moe-guide-debug)
+1. [Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and @fernbear.bsky.social and Boza Vlado and You Jiacheng and Franz Cesista and Braden Koszarsky and @Grad62304977. modded-nanogpt: Speedrunning the NanoGPT baseline](https://github.com/KellerJordan/modded-nanogpt)
 2. [Guilherme Penedo, Hynek Kydlíček, Loubna Ben allal, Anton Lozhkov, Margaret Mitchell, Colin Raffel, Leandro Von Werra, Thomas Wolf. "The fineweb datasets: Decanting the web for the finest text data at scale." arXiv preprint arXiv:2406.17557 (2024).](https://arxiv.org/abs/2406.17557)
 
 ## Citation
