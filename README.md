@@ -8,9 +8,9 @@ This repository is a fork of the [NanoGPT speedrun](https://github.com/KellerJor
 This is a modernized but simple causal transformer architecture, using rotary position embeddings, padded and untied token embeddings, RMSNorm, ReLU^2, QK-norm, and the Muon optimizer. This achieves 3.276 validation loss when trained for 2.4B tokens on the FineWeb dataset.
 
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-uv venv
-uv pip install -r requirements.txt
+git clone https://github.com/cat-state/modded-nanogpt-moe && cd modded-nanogpt-moe
+git checkout blogpost-version
+pip install -r requirements.txt
 python data/cached_fineweb10B.py 24
 ./run_dense.sh
 ```
@@ -19,9 +19,9 @@ python data/cached_fineweb10B.py 24
 This will train a top-k 1, 4 expert MoE. Each expert has the same architecture as the dense model, so the overall MoE is larger than the dense baseline, but has the same number of activated parameters. This achieves a 3.218 validation loss - an improvement of 1.8%. It gets to <3.28 val loss in 4000 steps, compared to 4500 for the baseline - an improvement of 11%.
 
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-uv venv
-uv pip install -r requirements.txt
+git clone https://github.com/cat-state/modded-nanogpt-moe && cd modded-nanogpt-moe
+git checkout blogpost-version
+pip install -r requirements.txt
 python data/cached_fineweb10B.py 24
 ./run_moe.sh
 ```
